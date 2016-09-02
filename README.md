@@ -5,6 +5,8 @@ Command line interface tool for managing various aspects of wordpress such as th
 ## Usage
 
 ```
+Usage - wpmanager <command> <action>
+
 Valid Commands:
         theme         - Allows installation, deletion, and activation of themes.
         plugin        - Install, delete, activate, and search for plugins.
