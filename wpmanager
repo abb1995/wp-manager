@@ -1,0 +1,892 @@
+#!/bin/bash
+
+
+dbName=$(egrep -i "db_name" wp-config.php | cut -d\' -f4)
+dbUser=$(egrep -i "db_user" wp-config.php | cut -d\' -f4)
+dbPass=$(egrep -i "db_password" wp-config.php | cut -d\' -f4)
+#Set variable for connecting to mysql
+mysqlconnect="mysql -u$(egrep -i "db_user" wp-config.php | cut -d\' -f4) -p$(egrep -i "db_password" wp-config.php | cut -d\' -f4) $(egrep -i "db_name" wp-config.php | cut -d\' -f4)"
+prefix=$(grep -i "table_prefix" wp-config.php | cut -d\' -f2)
+#Checks the current active theme
+activeTheme=$($mysqlconnect -e "select option_value from "$prefix"options where option_name='template' or option_name='stylesheet';" | tail -1)
+#Get wordpress installation version
+version=$(grep "wp_version =" wp-includes/version.php | cut -d\' -f2)
+#Check plugins that are installed
+installedPlugins=$(find wp-content/plugins -maxdepth 1 -type d | cut -d\/ -f3 | grep -xv "")
+
+#Return a printout of wordpress information such as active theme, permalinks, home/siteURL, database information, and plugins
+returnStatus() {
+	curTotalPlug=$(echo $pluginsValue | cut -d: -f2)
+	echo
+	$mysqlconnect -e "select * from wp_options where option_name='template' or option_name='stylesheet' or option_name='home' or option_name='siteURL' or option_name='permalink_structure';"
+
+	echo -e "\n\e[38;5;83mDatabase information:\e[0m"
+	echo "Database name: $dbName"
+	echo "Database username: $dbUser"
+	echo "Database password: $dbPass"
+	echo "Database prefix: $prefix"
+	echo -e "version: $version\n"
+
+	echo -ne "\e[38;5;83mTotal Installed Themes:\e[0m"
+	listThemes
+
+	echo -e "\n\e[38;5;83mTotal Active Plugins:\e[0m $curTotalPlug"
+	listPlugins
+	echo	
+}
+
+#Return all users on the site
+listUsers() {
+	numUsers=$($mysqlconnect -e "select ID from "$prefix"users;" | tail -1)
+	#Checks to see if there may be more than 20 users on the server. If so, prompt user to view them using less
+	if [[ $numUsers -lt 20 ]]; then
+		$mysqlconnect -e "select ID, user_login, user_email from "$prefix"users;"
+	else
+		echo "There may be more than twenty users on this installation. View anyway?(y/n)"
+		read opt
+		if [[ $opt == "y" ]]; then
+				$mysqlconnect -e "select ID, user_login, user_email from "$prefix"users;" | less
+		fi
+	fi
+}
+
+#Change the specified users password
+changeUserPass() {
+	user=$1
+
+	#Checks to see if the user entered a username or a userID
+	if [[ $user =~ [0-9]+ ]]; then
+		id=$user
+		#Gets the username for the specified ID, and makes necessary mysql updates
+		user=$($mysqlconnect -e "select user_login from "$prefix"users where ID='"$id"'" | tail -1)
+		$mysqlconnect -e "update "$prefix"users set user_pass=MD5('"$newPass"') where ID='"$id"';"
+		echo -e "\n\e[38;5;83mSuccess. \e[0mNew password for user '"$user"': '"$newPass"'"
+	else
+		$mysqlconnect -e "update "$prefix"users set user_pass=MD5('"$newPass"') where user_login='"$user"';"
+		echo -e "\n\e[38;5;83mSuccess. \e[0mNew password for user '"$user"': '"$newPass"'"
+	fi
+
+}
+
+#Change the specified user's email
+changeMail() {
+	userName=$1
+	email=$2
+
+	#Checks to see if the user entered a username or a userID
+	if [[ $userName =~ [0-9]+ ]]; then
+		id=$userName
+		#Gets the username for the specified ID, and makes necessary mysql updates
+		userName=$($mysqlconnect -e "select user_login from "$prefix"users where ID='"$id"'" | tail -1)
+		$mysqlconnect -e "update "$prefix"users set user_email='"$email"' where ID='"$id"';"
+	else
+		$mysqlconnect -e "update "$prefix"users set user_email='"$email"' where user_login='"$userName"';"
+	fi
+
+	echo -e "\n\e[38;5;83mSuccess. \e[0mEmail for user '"$userName"' has been updated to: '"$email"'"
+}
+
+#Verifies that the role entered by the user is valid and sets "$role" to the correct meta_value
+checkRole() {
+        case $1 in
+        "administrator")
+                role='a:1:{s:13:"administrator";b:1;}'
+                ;;
+        "editor")
+                role='a:1:{s:6:"editor";b:1;}'
+                ;;
+        "author")
+                role='a:1:{s:6:"author";b:1;}'
+                ;;
+        "contributor")
+                role='a:1:{s:11:"contributor";b:1;}'
+                ;;
+        "subscriber")
+                role='a:1:{s:10:"subscriber";b:1;}'
+                ;;
+        *)
+                echo "Role not recognized, please check spelling and try again!"
+                read role
+                checkRole $role
+                ;;
+        esac
+}
+
+#Updates the users role to role specified
+changeRole() {
+	userName=$1
+
+	#Checks to see if the user entered a username or a userID
+	if [[ $userName =~ [0-9]+ ]]; then
+		id=$userName
+		#Gets the username for the specified ID, and makes the necessary database updates
+		$mysqlconnect -e "update "$prefix"usermeta set meta_value='"$role"' where user_id='"$id"';"
+		userName=$($mysqlconnect -e "select user_login from "$prefix"users where ID='"$id"';" | tail -1)
+	else
+		id=$($mysqlconnect -e "select ID from "$prefix"users where user_login='"$userName"';" | tail -1)
+		$mysqlconnect -e "update "$prefix"usermeta set meta_value='"$role"' where user_id='"$id"';"
+	fi
+
+	#role is set to "a:1:{s:10:"subscriber";b:1;}" and needs to be formatted for output
+	role=$(echo $role | cut -d\" -f2)
+	echo -e "\n\e[38;5;83mSuccess!\e[0m User $userName has been set to '"$role"'."
+}
+
+#Create new users
+createUser() {
+	username=$1
+	email=$2
+	role=$3
+	#Set password to a ranom generated password
+	password=$(echo $RANDOM | md5sum | fold -12 | head -1)
+	id=$(($($mysqlconnect -e "select id from "$prefix"users;" | tail -1)+1))
+
+	#Make the necessary database updates for user to have access to wp-admin
+	$mysqlconnect -e "insert into "$prefix"users (ID, user_login, user_pass, user_nicename, user_email, user_status, display_name) values ("$id", '"$username"', MD5('"$password"'), '"$username"', '"$email"', '0', '"$username"');"
+	$mysqlconnect -e "insert into "$prefix"usermeta (umeta_id, user_id, meta_key, meta_value) values (NULL, "$id", 'wp_capabilities', '"$role"');"
+	$mysqlconnect -e "insert into "$prefix"usermeta (umeta_id, user_id, meta_key, meta_value) values (NULL, "$id", 'wp_user_level', '10');"
+	echo -e "\e[38;5;83mSuccess!\e[0m User $username has been created with the password \"$password\"."
+}
+
+#Delete existing users
+deleteUser() {
+	userName=$1
+	echo "This will completely remove this user, are you sure you would like to continue with deletion?(y/n)"
+	read opt
+
+	if [[ $opt == "y" ]]; then
+		#Checks to see if the user entered a username or a userID
+		if [[ $userName =~ [0-9]+ ]]; then
+			id=$userName
+			##Gets the username for the specified ID and makes the necessary database updates.
+			userName=$($mysqlconnect -e "select user_login from "$prefix"users where ID='"$id"';" | tail -1)
+			$mysqlconnect -e "delete from "$prefix"users where ID='"$id"' limit 1;"
+			$mysqlconnect -e "delete from "$prefix"usermeta where user_id='"$id"' limit 2;"
+		else
+			#Remove user from both wp_users and wp_usermeta
+			id=$($mysqlconnect -e "select ID from "$prefix"users where user_login='"$userName"';" | tail -1)
+			$mysqlconnect -e "delete from "$prefix"users where user_login='"$userName"' limit 1;"
+			$mysqlconnect -e "delete from "$prefix"usermeta where user_id='"$id"' limit 2;"
+		fi
+	fi
+
+	echo -e "\n\e[38;5;83mSuccess!\e[0m User $userName has been deleted."
+}
+
+#Generate multiple users with random names and passwords
+generateUsers(){
+	email=$1
+	role=$2
+	count=$3
+	index=0
+	#Run checkRole to ensure that the role entererd is valid
+	checkRole $role
+
+	#Run through loop to create a new user for the amount of users specified
+	while [[ $index -lt $count ]]; do
+		#Create a random username
+		username=$(echo $RANDOM | md5sum | fold -6 | head -1)
+		createUser $username $email $role
+		index=$((index+1))
+	done
+}
+
+#List installed plugins
+listPlugins() {
+	echo -e "\nInstalled plugins:\n"
+	index=1
+	#Loop over all of the installed plugins and determine if they are active
+	for i in $installedPlugins; do
+		#Attempts to grep the plugin name from active_plugins and tests the statuscode
+		checkPlug=$($mysqlconnect -e "select option_value from wp_options where option_name='active_plugins';" | grep -m 1 -o "\"$i" | tr -d \")	
+		#If statuscode is successful list plugin as active, else list plugin as inactive
+		#Also add plugins to an array to allow user to specify the number of the plugin 
+		#rather than the name when activating and deleting plugins
+		if [[ $checkPlug ]]; then
+			echo "$index: $i - Active"
+			pluginArray[$index]=$i
+			index=$((index+1))
+		else
+			echo "$index: $i - Inactive"
+			pluginArray[$index]=$i
+			index=$((index+1))
+		fi
+	done
+	echo
+}
+
+#Delete installed plugins
+deletePlugin() {
+	pluginName=$1
+	#Checks to see if the plugin is installed and sets the return code to returnVal
+	checkPlugin $pluginName
+	returnVal=$?
+	#Checks to see if the plugin is currently active. Prevent user from deleting plugins that are active
+	isPlugActive=$($mysqlconnect -e "select option_value from wp_options where option_name='active_plugins';" | grep -m 1 -o "\"$plug" | tr -d \")
+	#If checkPlugin return code == 0 then proceed to delete plugin
+	if [[ $returnVal == 0 ]]; then
+		#if plugin is active, notify user that plugin needs to be deactivated before it can be deleted
+		if [[ $isPlugActive ]]; then
+			echo -e "\n\e[38;5;196mFailed.\e[0m This plugin is currently active, please deactivate this plugin before deleting.\n"
+		else
+			find wp-content/plugins/$pluginName -delete
+			echo -e "\n\e[38;5;83mSuccess. \e[0m$pluginName has been deleted."
+		fi
+	else
+		echo -e "\n\e[38;5;196mFailed.\e[0m Unable to locate plugin." 
+	fi	
+}
+
+#Check to see if plugin is currently installed
+checkPlugin() {
+	plugName=$1
+	locatePlug=$(find wp-content/plugins -maxdepth 1 -type d -name "$plugName" | grep -o "$plugName")
+	if [[ $locatePlug ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+#Activate installed plugins
+activatePlugin() {
+	pluginName=$1
+	#Get the current value of 'active_plugins'
+	pluginsValue="$($mysqlconnect -e "select option_value from "$prefix"options where option_name='active_plugins';" | grep "a:")"
+	#Get the total active plugins
+	curTotalPlug=$(echo $pluginsValue | cut -d: -f2)
+	#Add one to curTotalPlug to get the new total active plugins
+	newTotalPlug=$((curTotalPlug+1))
+	#Value to append to $pluginsValue to update database. Format: i:plugNumber;s:lengthOfPlugValue:"plugin/plugin.php";
+	#plugValue=$(egrep -rio "Plugin Name: [a-zA-Z0-9\ \.\_\-]*" wp-content/plugins/$pluginName | head -1 | cut -d: -f1 | awk -F "/" '{ print $3"/"$4 }' | sed 's/\//\\\//')
+	plugValue=$(find wp-content/plugins/$pluginName -maxdepth 1 -type f -exec egrep -lio "Plugin Name: [a-zA-Z0-9\ \.\_\-]*" {} \; | head -1 | awk -F "/" '{ print $3"/"$4 }' | sed 's/\//\\\//')
+
+	#Length of "plugin/plugin.php"
+	s=$(echo ${#plugValue})
+	s=$((s-1))
+	#New plugin value to update to database
+	newPlugVal=$(echo $pluginsValue | sed "s/a:$curTotalPlug/a:$newTotalPlug/" | sed "s/\}/i:$curTotalPlug\;s:$s:\"$plugValue\"\;\}/")
+
+	#Update database with new plugin value
+	$mysqlconnect -e "update "$prefix"options set option_value='"$newPlugVal"' where option_name='active_plugins';"
+	curTotalPlug=$newTotalPlug
+
+	echo -e "\e[38;5;83mSuccess. \e[0m$pluginName has been activated."
+}
+
+#Correct plugin numbers in database. Correct format: First plugin begins with "i:0;" and increments by one for each plugin
+cleanDB() {
+	curTotalPlug=$1
+	newTotal=$2
+	
+
+	#Removes "a:(total plugins value):{" from the plugins value 
+	pluginsValue=$(echo $pluginsValue | cut -d{ -f2)
+
+	count=1
+	numCounter=1
+	#Loops over the plugins value and corrects the number each plugin is associated with. 
+	while [[ $count -le $curTotalPlug ]]; do
+			plugNum=$(echo $pluginsValue | cut -d{ -f2 | cut -d\; -f"$numCounter" | cut -d: -f2)
+			pluginsValue=$(echo $pluginsValue | sed -r "s/$plugNum;/$((count-1));/")
+			count=$((count+1))
+			numCounter=$((numCounter+2))
+	done
+}
+
+#Deactivate plugins
+deactivatePlugin() {
+	pluginName=$1
+	pluginsValue="$($mysqlconnect -e "select option_value from "$prefix"options where option_name='active_plugins';" | grep "a:")"
+	curTotalPlug=$(echo $pluginsValue | cut -d: -f2)
+	newTotalPlug=$((curTotalPlug-1))
+	#Checks to see if plugin is currently active
+	isPlugActive=$($mysqlconnect -e "select option_value from "$prefix"options where option_name='active_plugins';" | grep -m 1 -o "\"$pluginName" | tr -d \")
+
+	if [[ ! $isPlugActive ]]; then
+		echo -e "\e[38;5;196mFailed: \e[0m Plugin '"$pluginName"' is not active."
+	else
+		#Correct active_plugins values before making changes to ensure plugin is deactivated correctly
+		cleanDB $curTotalPlug $newTotalPlug
+		#Gets the current placement of the specified plugin in the active_plugins value and gets the length of the number
+		opt=$(echo $pluginsValue | cut -d\{ -f2 | egrep -o "i:[0-9]+;s:[0-9]+:\"$pluginName\/" | cut -d\; -f1 | cut -d: -f2)
+		length=${#opt}
+
+		#If number is two digits, use a different set of regex to ensure plugin is matched correctly
+		if [[ $length -eq 2 ]]; then
+			optOne=$(echo $opt | fold -1 | head -1)
+			optTwo=$(echo $opt | fold -1 | tail -1)
+			#Sed out the specified plugin and set the pluginsValue to the new value
+			pluginsValue=$(echo $pluginsValue | sed -r "s/i:[$optOne][$optTwo]+;[a-z]:[0-9]+:\"[A-Za-z0-9_\-]+\/?[A-Za-z_\.0-9\-]+[\.]?[A-Za-z]+\"\;//")
+		elif [[ $length -eq 1 ]]; then
+			#Sed out the specified plugin and set the pluginsValue to the new value
+			pluginsValue=$(echo $pluginsValue | sed -r "s/i:[$opt]+;[a-z]:[0-9]+:\"[A-Za-z0-9_\-]+\/?[A-Za-z_\.0-9\-]+[\.]?[A-Za-z]+\"\;//")
+		fi
+
+		#Run cleanDB again to make sure all database values are correct
+		cleanDB $curTotalPlug $newTotal
+		newPlugVal="a:$newTotalPlug:{$pluginsValue"
+		#update database with new plugin value
+		$mysqlconnect -e "update "$prefix"options set option_value='"$newPlugVal"' where option_name='active_plugins';"
+		echo -e "\e[38;5;83mSuccess: \e[0mPlugin '"$pluginName"' has been deactivated."
+	fi
+
+}
+
+#Install plugins from wordpress.org
+installPlugin() {
+	url=$1
+	#Get zip file and plugin name to make changes
+	zipFile=$(echo $url | cut -d\/ -f5);
+	pluginName=$(echo $zipFile | cut -d\. -f1)
+
+	#Download, unzip, and move plugin files to wp-content/plugins and then delete zip file
+	echo -e "\nDownloading plugin..."
+	wget -q $url
+	echo "Unzipping files..."
+	unzip -q $zipFile
+	echo "Installing plugin..."
+	mv $pluginName ./wp-content/plugins
+	find -name "$zipFile" -delete
+	echo -e "\n\e[38;5;83mSuccess. \e[0m$pluginName has been installed.\n"
+
+	#Allows the option to also activate the plugin after installation
+	echo "Would you like to activate this plugin?(y/n)"
+	read opt
+
+	if [[ $opt == "y" ]]; then
+		activatePlugin $pluginName
+	fi
+}
+
+#Seach wordpress.org for specified plugin
+searchPlugins() {
+	pluginName=$1
+	#Attempts to locate the plugin at https://wordpress.org/plugins/$pluginName/
+	search=$(curl -s https://wordpress.org/plugins/$pluginName/ | egrep -o "https\:\/\/downloads\.wordpress\.org\/plugin\/$pluginName[a-zA-Z0-9\.\_\-]+")
+
+	if [[ $search ]]; then
+		echo -e "\n\e[38;5;83mSuccess. \e[0mPlugin Located!"
+		#Runs checkPlugin and sets the return code to retrunVal
+		checkPlugin $pluginName
+		returnVal=$?
+		#If the plugin is already installed, prompt user, otherwise, install plugin
+		if [[ $returnVal == "0" ]]; then
+			echo -e "\n\e[38;5;196mWarning:\e[0m Plugin '"$pluginName"' already installed"
+		else
+			installPlugin $search
+		fi
+	else
+		echo -e "\n\e[38;5;196mFailed:\e[0m Unable to locate. Check spelling or run 'install' to use the direct URL"
+	fi
+}
+
+popularPlugins() {
+	#Set the current page number
+	pageCount=$1
+
+	#Parse browse page for plugin page URLs and total amount of pages with results depending on the current page number
+	if [[ $pageCount -eq 1 ]]; then
+		search=$(curl -s https://wordpress.org/plugins/browse/popular/ | egrep -o "https\:\/\/wordpress.org/plugins/[a-zA-Z0-9\.\_\-]+" | egrep -v "browse|search\.php|rss" | sort -u)
+		totalPages=$(curl -s https://wordpress.org/plugins/browse/popular/ | egrep -o "popular/page/[0-9]+" | cut -d\/ -f3 | sort -nru | head -1)
+	else
+		search=$(curl -s https://wordpress.org/plugins/browse/popular/page/$pageCount/ | egrep -o "https\:\/\/wordpress.org/plugins/[a-zA-Z0-9\.\_\-]+" | egrep -v "browse|search\.php|rss" | sort -u)
+		totalPages=$(curl -s https://wordpress.org/plugins/browse/popular/page/$pageCount/ | egrep -o "popular/page/[0-9]+" | cut -d\/ -f3 | sort -nru | head -1)
+	fi
+
+	index=1
+	if [[ $search ]]; then
+		echo
+		#Loop over the plugins found, print them out and insert them into an array
+		for i in $search; do
+			pluginName=$(echo $i | awk -F "/" '{ print $5}')
+			pluginArray[$index]=$pluginName
+			echo "$index: $pluginName"
+			index=$((index+1))
+		done
+		echo "Page $pageCount of $totalPages"
+		echo -e "\nEnter the number or name of the plugin you would like to install. Type 'next' to go to the next page, or 'prev' to go to the last page."
+		read opt
+
+		#Run the appropriate function based on the user's input
+		if [[ $opt =~ [0-9]+ ]]; then
+			searchPlugins ${pluginArray[$opt]}
+		elif [[ $opt == "next" ]]; then
+			popularPlugins $((pageCount+1))
+		elif [[ $opt == "prev" ]]; then
+			popularPlugins $((pageCount-1))
+		else
+			searchPlugins $opt
+		fi
+	fi
+}
+
+#Function to install theme from wordpress.org. Usage - installTheme <downloadURL>
+installTheme() {
+	url=$1
+	#Gets the name of the file out of the URL as well as the name of the theme without file extensions
+	zipFile=$(echo $url | cut -d\/ -f5);
+	themeName=$(echo $zipFile | cut -d\. -f1)
+	#Download theme, unzip contents, and then move them to wp-content/themes
+	echo -e "\nDownloading theme..."
+	wget -q $url
+	echo "Unzipping files..."
+	unzip -q $zipFile
+	echo "Installing theme..."
+	mv $themeName ./wp-content/themes
+	find -name "$zipFile" -delete
+	echo 'Done!'
+
+	echo -e "\n\e[38;5;83mSuccess. \e[0m$themeName has been installed.\n"
+	echo "Would you like to activate this theme?(y/n)"
+	read opt
+
+	#Run activateTheme if user would like to activate newly installed theme
+	if [[ $opt == "y" ]]; then
+		activateTheme $themeName
+	fi
+}
+
+#Function to check if provided theme exists on the site. Usage - checkTheme <themeName>
+checkTheme() {
+	themeName=$1
+	checkTheme=$(find wp-content/themes -maxdepth 1 -type d -name "$themeName" | grep -o "$themeName")
+	if [[ $(find -type d -name "$themeName" | grep -o "$themeName") ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+#Function to remove a theme from a site
+deleteTheme() {
+	themeName=$1
+	#Get the current active theme
+	#checkThemeVal=$($mysqlconnect -e "select option_value from "$prefix"options where option_name='template' or option_name='stylesheet';" | tail -1)
+	#run checkTheme to check if theme exists
+	checkTheme $themeName
+	#Checks to see if checkTheme was successful
+	returnVal=$?
+	if [[ $returnVal == "0" ]]; then
+		#If the theme you are wanting to delete is the active theme, provide error. Otherwise, remove theme
+		if [[ $activeTheme == $themeName ]]; then
+			echo -e "\n\e[38;5;196mFailed.\e[0m This is currently the active theme, please activate a different theme before deleting.\n"
+		else
+			find wp-content/themes/$themeName -delete
+			echo -e "\n\e[38;5;83mSuccess. \e[0m$themeName has been deleted.\n"
+		fi
+	else
+		echo -e "\n\e[38;5;196mFailed. \e[0mUnable to locate theme.\n"
+	fi	
+}
+
+#Provide a list of currently installed themes
+listThemes(){
+	getThemes=$(find wp-content/themes -maxdepth 1 -type d | awk -F "/" '{ print $3 }')
+	index=1
+	echo -e "\nInstalled themes:\n"
+	for i in $getThemes; do
+		themeVersion=$(egrep -m 1 -o "Version: [0-9\ \.\-]+" wp-content/themes/$i/style.css | tr -d " " | sed "s/:/: /")
+		if [[ $i == $activeTheme ]]; then
+			echo "$index: $i - ${themeVersion} - Active"
+		else
+			echo "$index: $i - $themeVersion"
+		fi
+		themeArray[$index]=$i
+		index=$((index+1))
+	done
+	echo
+}
+
+#Function to activate the provided theme
+activateTheme() {
+	themeName=$1
+	#Check to see if the provided theme exsists
+	checkTheme $themeName
+	returnVal=$?
+	
+	#If theme exists, activate the theme. Otherwise, provide error.
+	if [[ $returnVal == "0" ]]; then
+		echo "Activating theme..."
+		$mysqlconnect -e "update "$prefix"options set option_value='"$themeName"' where option_name='template' or option_name='stylesheet';"
+		echo -e "\n\e[38;5;83mSuccess. \e[0m$themeName has been activated.\n"
+	else
+		echo -e "\n\e[38;5;196mFailed. \e[0mUnable to locate theme.\n"
+	fi
+}
+
+#Function to search wordpress' site for the specified theme.
+searchThemes() {
+	themeName=$1
+	#Get the current page number
+	pageCount=$(echo $themeName | awk -F "/" '{ print $2 }')
+	index=1
+
+	#Curl the search page of wordpress.org for the specified theme and attempt to grep out the download URL for the theme. 
+        #If multiple instances of the same word are located in download links, they will all be provided. 
+        #E.g searching for twenty will return all of the twenty themes such as twentyten twentyeleven, etc.
+	if [[ $(echo $pageCount) == "" ]]; then
+		pageCount=1
+		search=$(curl -s https://wordpress.org/themes/search/$themeName | egrep -o "https\:\/\/downloads\.wordpress\.org\/theme\/[a-zA-Z0-9\.\_\-]*$themeName[a-zA-Z0-9\.\_\-]*\.[a-zA-Z0-9\.\-]+")
+		totalPages=$(curl -s https://wordpress.org/themes/search/$themeName | egrep -o "https://wordpress.org/themes/search/$themeName/page/[0-9]+" | cut -d\/ -f8 | sort -nr | head -1)
+
+	else
+		themeName=$(echo $themeName | awk -F "/" '{ print $1 }')
+		search=$(curl -s https://wordpress.org/themes/search/$themeName/page/$pageCount | egrep -o "https\:\/\/downloads\.wordpress\.org\/theme\/[a-zA-Z0-9\.\_\-]*$themeName[a-zA-Z0-9\.\_\-]*\.[a-zA-Z0-9\.\-]+")
+		#Check the total number of pages that search results returned
+		totalPages=$(curl -s https://wordpress.org/themes/search/$themeName/page/$pageCount | egrep -o "https://wordpress.org/themes/search/$themeName/page/[0-9]+" | cut -d\/ -f8 | sort -nr | head -1)
+
+	fi
+
+	#If a successful search was completed, parse output
+	if [[ $search ]]; then
+		#Check to see if multiple download links were located, or only one.
+		if [[ $(echo $search | awk -F " " '{ print $2 }') ]]; then	
+			#echo -e "The following themes were located using the search term '"$themeName"':\n"
+			echo
+			#Print out each theme located, as well as place the download URL in an array
+			for i in $search; do
+				theme=$(echo $i | cut -d\/ -f5 | cut -d\. -f1)
+				#rating=$(curl -s https://wordpress.org/themes/$theme/ | egrep -o -m 1 "rating-[0-9]+" | cut -d\- -f2) #Runs extremely slowly
+				#echo "$index: $theme - Rating: $rating"
+				echo "$index: $theme"
+				themeArray[$index]=$i
+				index=$((index+1))
+			done
+			echo "Page $pageCount of $totalPages"
+			echo -e "\nEnter the name or number of the theme you would like to install from this list. Type 'next' to go to the next page."
+			read opt
+			#Run installTheme with the value at the index the user specified
+			if [[ $opt =~ [0-9]+ ]]; then
+				installTheme ${themeArray[$opt]}
+			elif [[ $opt == "next" ]]; then
+				searchThemes "$themeName/$((pageCount+1))"
+			else
+				searchThemes $opt
+			fi
+		else
+			echo -e "\n\e[38;5;83mSuccess. \e[0mTheme Located!"
+			installTheme $search
+		fi
+	else
+		echo -e "\n\e[38;5;196mFailed. \e[0mUnable to locate theme on wordpress.org.\n"
+	fi
+}
+
+#Function to view the themes featured on wordpress.org/themes
+showFeatured() {
+	search=$(curl -s https://wordpress.org/themes/ | egrep -o "https\:\/\/downloads\.wordpress\.org\/theme\/[a-zA-Z0-9\.\_\-]*\.[a-zA-Z0-9\.\-]+")
+	index=1
+	echo
+	#Parse each URL and add it to an array
+	for i in $search; do
+		URL=$i
+		zipFile=$(echo $URL | cut -d\/ -f5)
+		themeName=$(echo $zipFile | cut -d\. -f1)
+		themeArray[$index]=$URL
+		echo "$index: $themeName"
+		index=$((index+1))
+	done
+
+	echo -e "\nEnter the number or name of the theme to install."
+	read opt
+
+	#Run the appropriate function based on user input
+	#If user input is a number, run installTheme with the URL located at that index
+	#Otherwise, run searchThemes to get the URL from wordpress.org
+	if [[ $opt =~ [0-9]+ ]]; then
+		installTheme ${themeArray[$opt]}
+	else
+		searchThemes $themeName
+	fi
+}
+
+#Show themes listed at wordpress.org/themes/browse/popular
+showPopular() {
+	pageCount=$1
+	search=$(curl -s https://wordpress.org/themes/browse/popular/page/$pageCount | egrep -o "https\:\/\/downloads\.wordpress\.org\/theme\/[a-zA-Z0-9\.\_\-]*\.[a-zA-Z0-9\.\-]+")
+	totalPages=$(curl -s https://wordpress.org/themes/browse/popular/page/$pageCount | egrep -o "https://wordpress.org/themes/browse/popular/page/[0-9]+" | cut -d\/ -f8 | sort -nr | head -1)
+
+	index=1
+	echo
+	#Parse each URL and add it to an array
+	for i in $search; do
+                URL=$i
+                zipFile=$(echo $URL | cut -d\/ -f5)
+                themeName=$(echo $zipFile | cut -d\. -f1)
+                themeArray[$index]=$URL
+                echo "$index: $themeName"
+                index=$((index+1))
+        done
+
+	echo "Page $pageCount of $totalPages"
+	echo -e "\nEnter the number or name of the theme to install. Type 'next' to go to the next page, or 'prev' to go to the last page."
+        read opt
+
+        #Run the appropriate function based on user input
+        #If user input is a number, run installTheme with the URL located at that index
+        #Otherwise, run searchThemes to get the URL from wordpress.org
+	if [[ $opt =~ [0-9]+ ]]; then
+		installTheme ${themeArray[$opt]}
+	elif [[ $opt == "next" ]]; then
+		showPopular $((pageCount+1))
+	elif [[ $opt == "prev" ]]; then
+		showPopular $((pageCount-1))
+	else
+		searchThemes $themeName
+	fi
+}
+
+#Display help information for theme actions
+showThemeHelp() {
+	echo -e "\nUsage - wp-cli theme <action>\n"
+	echo "Valid actions:"
+	echo "	install       - Install theme using download URL from wordpress.org"
+	echo "	activate      - Activate specified theme."
+	echo "	delete        - Uninstall specified theme."
+	echo "	search        - Search wordpress database for provided theme. Enter partial names for bulk searching."
+	echo "	featured      - List the featured themes from wordpress.org."
+	echo "	popular       - List popular themes by page."
+	echo "	list          - Lists currently installed themes."
+	echo
+}
+
+#Show help information for plugin actions
+showPlugHelp() {
+	echo -e "\nUsage - wp-cli plugin <action>\n"
+	echo "Valid Actions:"
+	echo "	install       - Install plugin using download URL from wordpress.org."
+	echo "	activate      - Activate specified plugin."
+	echo "	deactivate    - Deactivate specified plugin."
+	echo "	delete        - Uninstall specified plugins."
+	echo "	search        - Search wordpress database for specified plugin."
+	echo "	popular       - List popular plugins by page."
+	echo "	list          - List all currently installed plugins"
+	echo
+}
+
+#Show help information for user actions
+showUserHelp() {
+	echo -e "\nUsage - wp-cli user <action>\n"
+	echo "Valid actions:"
+	echo "	create         - Create new users."
+	echo "	changepass     - Change password for users."
+	echo "	changemail     - Change user's email address."
+	echo "	changerole     - Change roles for users."
+	echo "	generate       - Generate multiple random users."
+	echo "	delete         - Delete users from installation."
+	echo "	list           - List current users."
+	echo
+}
+
+#Show help information for main commands
+showMainHelp() {
+	echo -e "\nUsage - wp-cli <command> <action>\n"
+	echo "Valid Commands:"
+	echo "	theme         - Allows installation, deletion, and activation of themes."
+	echo "	plugin        - Install, delete, activate, and search for plugins."
+	echo "	user          - Manage users for current installation."
+	echo "	status        - Displays information about the current wordpress installation."
+	echo
+}
+
+#Check user input when running script to see which action to perform
+case $1 in
+"theme")
+	case $2 in
+	"install")
+		echo "Enter the URL for the theme you would like to install:"
+		read opt
+		installTheme $opt
+		;;
+	"delete")
+		listThemes
+		echo "Enter the name or number of the theme you would like to delete:"
+		read opt
+		#If user enters a number, run deleteTheme with the theme located at $opt index in the themeArray
+		if [[ $opt =~ [0-9]+ ]]; then
+			opt=${themeArray[$opt]}
+		fi
+		deleteTheme $opt
+		;;
+	"activate")
+		listThemes
+		echo "Enter the name of number of the theme you would like to activate:"
+		read opt
+		#If user enters a number, run activateTheme with the theme located at $opt index in the themeArray
+		if [[ $opt =~ [0-9]+ ]]; then
+			opt=${themeArray[$opt]}
+		fi
+		activateTheme $opt
+		;;
+	"list")
+		listThemes
+		;;
+	#Run searchThemes to search wordpress.org for specified theme
+	"search")
+		echo "Enter the name of the theme you would like to search for:"
+		read opt
+		searchThemes $opt
+		;;
+	#Run showFeatured to display the themes listed on wordpress.org featured page
+	"featured")
+		showFeatured
+		;;
+	#Show list of popular themes from wordpress.org by page
+	"popular")
+		showPopular 1
+		;;
+	*)
+		showThemeHelp
+		;;
+	esac
+	;;
+"plugin")
+	case $2 in
+	"list")
+		listPlugins
+		;;
+	#Run searchPlugins to search wordpress.org for specified plugin
+	"search")
+		echo "Enter the name of the plugin you would like to search for:"
+		read opt
+		searchPlugins $opt
+		;;
+	#Show list of popular plugins from wordpress.org by page
+	"popular")
+		popularPlugins 1
+		;;
+	"delete")
+		listPlugins
+		echo -e "\nEnter the name or number of the plugin you would like to delete:"
+		read opt
+		#If user enters a number, run deletePlugin with the plugin located at $opt index in the pluginArray
+		if [[ $opt =~ [0-9]+ ]]; then
+			deletePlugin ${pluginArray[$opt]}
+		else
+			deletePlugin $opt
+		fi
+		;;
+	"install")
+                    echo "Enter the URL for the plugin you would like to install:"
+                    read opt
+		installPlugin $opt
+		;;
+	"activate")
+		listPlugins
+		echo -e "\nEnter the name or number of the plugin you would like to activate:"
+		read opt
+		#If user enters a number, run activatePlugin with the plugin located at $opt index in the pluginArray
+		if [[ $opt =~ [0-9]+ ]]; then
+			activatePlugin ${pluginArray[$opt]}
+		else
+			if [[ $opt != "all" ]]; then
+				activatePlugin $opt
+			else
+				#Run activatePlugin consecutively with all of the plugins listed in pluginArray
+				for i in ${pluginArray[@]}; do
+					activatePlugin $i
+					#echo $i
+				done
+			fi
+		fi
+		;;
+	"deactivate")
+		listPlugins
+		echo -e "\nEnter the name or number of the plugin you would like to deactivate:"
+		read opt
+		#If user enters a number, run deactivatePlugin with the plugin located at $opt index in the pluginArray
+		if [[ $opt =~ [0-9]+ ]]; then
+			deactivatePlugin ${pluginArray[$opt]}
+		else
+			if [[ $opt != "all" ]]; then
+				deactivatePlugin $opt
+			else
+				#Run deactivatePlugin consecutively with all of the plugins listed in pluginArray
+				for i in ${pluginArray[@]}; do
+					deactivatePlugin $i
+				done
+			fi
+		fi
+		;;
+	*)
+		showPlugHelp
+		;;
+	esac
+	;;
+"status")
+	returnStatus
+	;;
+"user")
+	case $2 in
+	"create")
+		echo "Enter username for the new user:"
+		read username
+		echo -e "\nEnter email for '"$username"':"
+		read email
+		echo -e "\nEnter role for '"$username"':(administrator, author, editor, etc.)"
+		read role
+		checkRole $role
+		createUser $username $email $role
+		;;
+	#Generate multiple accounts based off of user input
+	"generate")
+		echo "Enter the amount of users to create:"
+		read count
+		echo "Enter the email address to use for these users:"
+		read email
+		echo "Enter the role for these users:"
+		read role
+		generateUsers $email $role $count
+		;;
+	"changerole")
+		listUsers
+		echo "Enter the ID or username for the user you would like to update:"
+		read opt
+		echo "Enter the new role for this user:"
+		read role
+		checkRole $role
+		changeRole $opt
+		;;
+	"delete")
+		listUsers
+		echo "Enter the ID or username for the user you would like to delete:"
+		read opt
+		deleteUser $opt
+		;;
+	"list")
+		listUsers
+		;;
+	"changepass")
+		listUsers
+		echo "Enter the name or ID of the user you would like to edit:"
+		read user
+        	echo "Generate random password?(y/n)"
+        	read opt
+
+		#Set newPass to a randomly generated password
+        	if [[ $opt == "y" ]]; then
+                	newPass=$(echo $RANDOM | md5sum | fold -12 | head -1)
+       		else
+                	echo "Enter new password:"
+                	read newPass
+        	fi
+		changeUserPass $user $newPass
+		;;
+	"changemail")
+		listUsers
+		echo "Enter the name or ID of the user you would like to edit:"
+		read user
+		echo "Enter the new email address for this user:"
+		read email
+		changeMail $user $email
+		;;
+	*)
+		showUserHelp
+		;;
+	esac
+	;;
+*)
+	showMainHelp
+	;;
+esac
